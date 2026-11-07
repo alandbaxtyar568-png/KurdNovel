@@ -263,6 +263,19 @@ jobs:
            window.__kmHi=function(i){document.querySelectorAll('[data-km-hi]').forEach(function(e){e.style.background='';e.removeAttribute('data-km-hi');});
             var e=document.querySelector('[data-km="'+i+'"]');
             if(e){e.setAttribute('data-km-hi','1');e.style.background='rgba(124,92,255,0.35)';e.scrollIntoView({block:'center',behavior:'smooth'});}};
+           window.__kmNext=function(){
+            var cur=location.href.split('#')[0];
+            var r=document.querySelector('link[rel~="next"],a[rel~="next"]');
+            if(r&&r.href&&r.href.split('#')[0]!==cur)return r.href;
+            var best=null,list=document.querySelectorAll('a[href]');
+            for(var k=0;k<list.length;k++){var e=list[k];var h=e.href||'';
+             if(!h||h.indexOf('http')!==0||h.split('#')[0]===cur)continue;
+             if(e.offsetParent===null)continue;
+             var t=((e.innerText||'')+' '+(e.getAttribute('aria-label')||'')+' '+(e.getAttribute('title')||'')).replace(/\s+/g,' ').trim().toLowerCase();
+             var c=(e.className&&e.className.toString)?e.className.toString().toLowerCase():'';
+             var ok=/^(next|next chapter|next >|next ›|next »|›|»|→|>)/.test(t)||/next[ _-]?chap|chap[a-z]*[ _-]?next|next-btn|btn-next|j_next/.test(c);
+             if(ok)best=e;}
+            return best?best.href:'';};
            window.__kmFont=function(px){window.__kmFs=px;
             document.querySelectorAll('[data-km]').forEach(function(e){e.style.fontSize=px+'px';e.style.lineHeight='1.9';});};
           })();
@@ -306,6 +319,34 @@ jobs:
               private val vekol by lazy { VekolTts(this) }
               private var useVekol = false
               @Volatile private var vekolGen = 0
+              private var contNav = false
+              private var scrolling = false
+              private var scrollLvl = 0
+              private var scrollAcc = 0f
+              private var bottomTicks = 0
+              private val scrollLevels = floatArrayOf(0.4f, 0.8f, 1.5f, 2.5f)
+              private lateinit var scrollBtn: TextView
+              private val scrollTick = object : Runnable {
+                  override fun run() {
+                      if (!scrolling) return
+                      if (!contNav) {
+                          scrollAcc += scrollLevels[scrollLvl - 1] * resources.displayMetrics.density
+                          val px = scrollAcc.toInt()
+                          scrollAcc -= px
+                          if (px > 0) web.scrollBy(0, px)
+                          if (!web.canScrollVertically(1)) {
+                              bottomTicks++
+                              if (bottomTicks > 45) {
+                                  bottomTicks = 0
+                                  goNextChapter()
+                              }
+                          } else {
+                              bottomTicks = 0
+                          }
+                      }
+                      ui.postDelayed(this, 30)
+                  }
+              }
               private lateinit var readBtn: TextView
               private lateinit var speedBtn: TextView
               private val speeds = floatArrayOf(0.7f, 0.85f, 1.0f, 1.2f, 1.5f)
@@ -413,9 +454,11 @@ jobs:
                   trBtn = btn("") { toggleAuto() }
                   viewBtn = btn("") { toggleView() }
                   readBtn = btn("") { toggleRead() }
+                  scrollBtn = btn("") { cycleScroll() }
                   speedBtn = btn("") { cycleSpeed() }
                   r2.addView(trBtn, lp())
                   r2.addView(readBtn, lp())
+                  r2.addView(scrollBtn, lp())
                   r2.addView(viewBtn, lp())
                   r2.addView(btn("🔤 فۆنت") { fontDialog() }, lp())
                   r2.addView(btn("A−") { changeFont(-2) }, lp())
@@ -442,7 +485,10 @@ jobs:
                   web.webViewClient = object : WebViewClient() {
                       override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                           if (url != null) urlEt.setText(url)
-                          if (reading) stopReading()
+                          if (!contNav) {
+                              if (reading) stopReading()
+                              if (scrolling) stopScroll()
+                          }
                           ui.removeCallbacks(tick)
                       }
 
@@ -450,6 +496,11 @@ jobs:
                           showOrig = false
                           styleBtns()
                           if (auto) ui.postDelayed(tick, 1800)
+                          if (contNav) {
+                              contNav = false
+                              bottomTicks = 0
+                              if (reading) ui.postDelayed({ if (reading) { emptyRetries = 0; startReading(-1) } }, 2500)
+                          }
                       }
 
                       override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
@@ -535,6 +586,8 @@ jobs:
                   readBtn.text = if (reading) "■ وەستاندن" else "🔊 بیخوێنەوە"
                   readBtn.background = if (reading) rr(ACC, 14) else rr(SURF, 14)
                   speedBtn.text = "⏩ خێرایی ×" + speed
+                  scrollBtn.text = if (scrolling) "⏸ سکڕۆڵ ×" + scrollLvl else "⬇ سکڕۆڵی خۆکار"
+                  scrollBtn.background = if (scrolling) rr(ACC, 14) else rr(SURF, 14)
               }
 
               private fun toggleAuto() {
@@ -704,6 +757,12 @@ jobs:
                       noVoiceDialog()
                       return
                   }
+                  if (scrolling) stopScroll()
+                  if (!auto) {
+                      auto = true
+                      styleBtns()
+                      translateNew()
+                  }
                   reading = true
                   emptyRetries = 0
                   styleBtns()
@@ -733,7 +792,18 @@ jobs:
                           } catch (e: Exception) {
                           }
                           if (items.isEmpty()) {
-                              if (emptyRetries < 6) {
+                              if (busy) {
+                                  ui.postDelayed({ if (reading) startReading(from) }, 1500)
+                              } else if (from >= 0) {
+                                  if (emptyRetries < 2) {
+                                      emptyRetries++
+                                      web.evaluateJavascript("window.scrollBy(0,window.innerHeight*0.9);", null)
+                                      ui.postDelayed({ if (reading) startReading(from) }, 2000)
+                                  } else {
+                                      emptyRetries = 0
+                                      goNextChapter()
+                                  }
+                              } else if (emptyRetries < 20) {
                                   emptyRetries++
                                   ui.postDelayed({ if (reading) startReading(from) }, 2000)
                               } else {
@@ -760,6 +830,41 @@ jobs:
                           }
                       }
                   }
+              }
+
+              private fun goNextChapter() {
+                  if (contNav) return
+                  web.evaluateJavascript(JS_INIT, null)
+                  web.evaluateJavascript("window.__kmNext();") { raw ->
+                      val u = try { (JSONTokener(raw).nextValue() as? String) ?: "" } catch (e: Exception) { "" }
+                      if (u.isBlank()) {
+                          if (reading) stopReading()
+                          if (scrolling) stopScroll()
+                          toast("بەشی دواتر نەدۆزرایەوە. خۆت دوگمەی Next دابگرە.")
+                      } else {
+                          contNav = true
+                          stat.text = "➡ بەشی دواتر..."
+                          ui.postDelayed({ contNav = false }, 60000)
+                          web.loadUrl(u)
+                      }
+                  }
+              }
+
+              private fun cycleScroll() {
+                  if (reading) stopReading()
+                  scrollLvl = (scrollLvl + 1) % (scrollLevels.size + 1)
+                  ui.removeCallbacks(scrollTick)
+                  scrolling = scrollLvl > 0
+                  bottomTicks = 0
+                  if (scrolling) ui.post(scrollTick)
+                  styleBtns()
+              }
+
+              private fun stopScroll() {
+                  scrolling = false
+                  scrollLvl = 0
+                  ui.removeCallbacks(scrollTick)
+                  styleBtns()
               }
 
               private fun noVoiceDialog() {
@@ -812,11 +917,11 @@ jobs:
                   Thread {
                       try {
                           vekol.load()
-                          for (p in items) {
-                              if (!reading || gen != vekolGen) return@Thread
-                              ui.post { web.evaluateJavascript("window.__kmHi(" + p.first + ");", null) }
-                              vekol.speak(p.second, speed) { !(reading && gen == vekolGen) }
-                          }
+                          vekol.speakAll(
+                              items, speed,
+                              { i -> ui.post { web.evaluateJavascript("window.__kmHi(" + i + ");", null) } },
+                              { !(reading && gen == vekolGen) }
+                          )
                           ui.post { if (reading && gen == vekolGen) startReading(lastIdx + 1) }
                       } catch (e: Throwable) {
                           ui.post {
@@ -926,6 +1031,9 @@ jobs:
                           lengthS = inf.optDouble("length_scale", 1.0).toFloat()
                           noiseW = inf.optDouble("noise_w", 0.8).toFloat()
                       }
+                      noise = 0.74f
+                      noiseW = 0.88f
+                      lengthS *= 1.06f
                       val pm = cfg.getJSONObject("phoneme_id_map")
                       idMap.clear()
                       val keysIt = pm.keys()
@@ -966,6 +1074,11 @@ jobs:
                       .replace('ة', 'ە').replace('ؤ', 'ۆ')
                   t = t.replace(Regex("[ً-ٰٟـ]"), "")
                   t = t.replace('؟', '?').replace('،', ',').replace('؛', ';')
+                  t = t.replace("...", "…")
+                  t = t.replace(Regex("[\"“”«»'‘’]"), "")
+                  t = t.replace(Regex("[\\[\\](){}*_~#|/\\\\<>=+^@]"), " ")
+                  t = t.replace(Regex("\\s+[-–—]+\\s+"), ", ")
+                  t = t.replace('…', '.')
                   t = t.replace(Regex("\\s+"), " ").trim()
                   return t
               }
@@ -1064,7 +1177,7 @@ jobs:
                   }
               }
 
-              private fun infer(ids: LongArray, speed: Float): ShortArray {
+              private fun infer(ids: LongArray, speed: Float, jit: Float): ShortArray {
                   val e = env ?: throw RuntimeException("model not loaded")
                   val s = session ?: throw RuntimeException("model not loaded")
                   val inputs = HashMap<String, OnnxTensor>()
@@ -1078,7 +1191,7 @@ jobs:
                       if (inputNames.contains("scales")) {
                           val sp = if (speed <= 0f) 1f else speed
                           inputs["scales"] = OnnxTensor.createTensor(
-                              e, FloatBuffer.wrap(floatArrayOf(noise, lengthS / sp, noiseW)), longArrayOf(3L)
+                              e, FloatBuffer.wrap(floatArrayOf(noise, lengthS * jit / sp, noiseW)), longArrayOf(3L)
                           )
                       }
                       if (inputNames.contains("sid")) {
@@ -1140,10 +1253,57 @@ jobs:
                   return parts
               }
 
-              /** دەق دەخوێنێتەوە و تا تەواو نەبێت ناگەڕێتەوە. cancelled() ئەگەر true بوو، دەوەستێت. */
-              fun speak(text: String, speed: Float, cancelled: () -> Boolean) {
-                  val chunks = split(text)
-                  if (chunks.isEmpty()) return
+              private class Ck(val item: Int, val text: String, val firstOfItem: Boolean, val lastOfItem: Boolean)
+
+              private val exec = java.util.concurrent.Executors.newSingleThreadExecutor()
+              private val rnd = java.util.Random()
+
+              private fun fade(p: ShortArray) {
+                  val n = minOf(sampleRate / 160, p.size / 2)
+                  for (i in 0 until n) {
+                      val g = i.toFloat() / n
+                      p[i] = (p[i] * g).toInt().toShort()
+                      p[p.size - 1 - i] = (p[p.size - 1 - i] * g).toInt().toShort()
+                  }
+              }
+
+              private fun silence(t: AudioTrack, ms: Int, cancelled: () -> Boolean): Int {
+                  val n = sampleRate * ms / 1000
+                  val z = ShortArray(minOf(maxOf(n, 1), 4096))
+                  var left = n
+                  while (left > 0) {
+                      if (cancelled()) return -1
+                      val k = minOf(left, z.size)
+                      val w = t.write(z, 0, k)
+                      if (w <= 0) return -1
+                      left -= w
+                  }
+                  return n
+              }
+
+              /** هەموو پەرەگرافەکان بە دوای یەکدا دەخوێنێتەوە، لەگەڵ وەستانی سروشتی. onItem بۆ هەڵدانی پەرەگرافە. */
+              fun speakAll(items: List<Pair<Int, String>>, speed: Float, onItem: (Int) -> Unit, cancelled: () -> Boolean) {
+                  val cks = ArrayList<Ck>()
+                  for (it0 in items) {
+                      val parts = split(it0.second)
+                      for ((k, p) in parts.withIndex()) cks.add(Ck(it0.first, p, k == 0, k == parts.size - 1))
+                  }
+                  if (cks.isEmpty()) return
+                  val futs = arrayOfNulls<java.util.concurrent.Future<ShortArray?>>(cks.size)
+                  fun submit(i: Int) {
+                      if (i < cks.size && futs[i] == null) {
+                          val c = cks[i]
+                          val jit = 0.97f + rnd.nextFloat() * 0.08f
+                          futs[i] = exec.submit(java.util.concurrent.Callable<ShortArray?> {
+                              if (cancelled()) {
+                                  null
+                              } else {
+                                  val ids = toIds(c.text)
+                                  if (ids.size < 3) null else infer(ids, speed, jit)
+                              }
+                          })
+                      }
+                  }
                   val minBuf = AudioTrack.getMinBufferSize(
                       sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
                   )
@@ -1161,26 +1321,45 @@ jobs:
                               .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                               .build()
                       )
-                      .setBufferSizeInBytes(maxOf(minBuf, sampleRate * 2))
+                      .setBufferSizeInBytes(maxOf(minBuf, sampleRate))
                       .setTransferMode(AudioTrack.MODE_STREAM)
                       .build()
                   track = t
                   var frames = 0L
                   try {
                       t.play()
-                      for (c in chunks) {
+                      submit(0)
+                      submit(1)
+                      submit(2)
+                      for (i in cks.indices) {
                           if (cancelled()) return
-                          val ids = toIds(c)
-                          if (ids.size < 3) continue
-                          val pcm = infer(ids, speed)
-                          var off = 0
-                          while (off < pcm.size) {
-                              if (cancelled()) return
-                              val n = t.write(pcm, off, pcm.size - off)
-                              if (n <= 0) return
-                              off += n
+                          submit(i + 3)
+                          val c = cks[i]
+                          val pcm = try {
+                              futs[i]!!.get()
+                          } catch (e: java.util.concurrent.ExecutionException) {
+                              throw (e.cause ?: e)
                           }
-                          frames += pcm.size
+                          if (cancelled()) return
+                          if (c.firstOfItem) onItem(c.item)
+                          if (pcm != null) {
+                              fade(pcm)
+                              var off = 0
+                              while (off < pcm.size) {
+                                  if (cancelled()) return
+                                  val n = t.write(pcm, off, pcm.size - off)
+                                  if (n <= 0) return
+                                  off += n
+                              }
+                              frames += pcm.size
+                          }
+                          val endCh = c.text.trimEnd().lastOrNull()
+                          val sentenceEnd = endCh != null && ".!?؟…".indexOf(endCh) >= 0
+                          var ms = if (c.lastOfItem) 650 else if (sentenceEnd) 330 else 140
+                          ms = (ms * (0.88f + rnd.nextFloat() * 0.3f)).toInt()
+                          val s = silence(t, ms, cancelled)
+                          if (s < 0) return
+                          frames += s
                       }
                       t.stop()
                       var guard = 0
@@ -1189,6 +1368,9 @@ jobs:
                           guard++
                       }
                   } finally {
+                      for (f in futs) {
+                          try { f?.cancel(false) } catch (x: Exception) { }
+                      }
                       try { t.release() } catch (x: Exception) { }
                       if (track === t) track = null
                   }
