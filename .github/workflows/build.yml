@@ -196,41 +196,180 @@ jobs:
                   return parts.joinToString(" ") { googleChunk(it) }
               }
 
-              fun gemini(key: String, model: String, texts: List<String>): List<String>? {
+              class GemRes(val texts: List<String>, val names: Map<String, String>)
+
+              private fun geminiOnce(key: String, model: String, prompt: String): Pair<Int, String?> {
                   return try {
-                      val arr = JSONArray()
-                      for (t in texts) arr.put(t)
-                      val prompt = "You are a professional literary translator from English to Kurdish Sorani (Central Kurdish, Arabic script). " +
-                          "You translate web novels (dark fantasy, LitRPG, cultivation). Below is a JSON array of consecutive paragraphs " +
-                          "from ONE chapter, in order. Translate like a published Kurdish novel: literary, flowing narration, natural spoken " +
-                          "dialogue, keep the mood, tension and emotion. Never translate word by word. Use Kurdish letters (ە ێ ۆ ڕ ڵ ک ی). " +
-                          "Transliterate character names, places and skill names into Arabic script and keep them identical in every paragraph. " +
-                          "Keep short system/status messages short. Return ONLY a JSON array of exactly " + texts.size +
-                          " strings, same order, no commentary.\n" + arr.toString()
                       val body = JSONObject()
                           .put("contents", JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt)))))
-                          .put("generationConfig", JSONObject().put("temperature", 0.6).put("responseMimeType", "application/json"))
+                          .put("generationConfig", JSONObject().put("temperature", 0.4).put("topP", 0.9).put("responseMimeType", "application/json"))
                       val c = URL("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + key)
                           .openConnection() as HttpURLConnection
                       c.requestMethod = "POST"
                       c.doOutput = true
-                      c.connectTimeout = 8000
-                      c.readTimeout = 60000
+                      c.connectTimeout = 10000
+                      c.readTimeout = 90000
                       c.setRequestProperty("Content-Type", "application/json")
                       c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-                      if (c.responseCode !in 200..299) return null
+                      val code = c.responseCode
+                      if (code !in 200..299) return Pair(code, null)
                       val resp = c.inputStream.bufferedReader().use { it.readText() }
                       val text = JSONObject(resp).getJSONArray("candidates").getJSONObject(0)
                           .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
+                      Pair(code, text)
+                  } catch (e: Exception) {
+                      Pair(-1, null)
+                  }
+              }
+
+              private fun parseGem(text: String, n: Int): GemRes? {
+                  try {
+                      val os = text.indexOf('{')
+                      val oe = text.lastIndexOf('}')
+                      if (os >= 0 && oe > os) {
+                          val o = JSONObject(text.substring(os, oe + 1))
+                          val t = o.getJSONArray("t")
+                          if (t.length() != n) return null
+                          val names = LinkedHashMap<String, String>()
+                          val nm = o.optJSONObject("names")
+                          if (nm != null) {
+                              val it2 = nm.keys()
+                              while (it2.hasNext()) {
+                                  val k = it2.next()
+                                  val v = fix(nm.optString(k, ""))
+                                  if (k.isNotBlank() && v.isNotBlank()) names[k] = v
+                              }
+                          }
+                          return GemRes(List(n) { fix(t.optString(it, "")) }, names)
+                      }
                       val st = text.indexOf('[')
                       val en = text.lastIndexOf(']')
-                      if (st < 0 || en <= st) return null
-                      val out = JSONArray(text.substring(st, en + 1))
-                      if (out.length() != texts.size) return null
-                      List(out.length()) { fix(out.optString(it, "")) }
+                      if (st >= 0 && en > st) {
+                          val t = JSONArray(text.substring(st, en + 1))
+                          if (t.length() != n) return null
+                          return GemRes(List(n) { fix(t.optString(it, "")) }, emptyMap())
+                      }
                   } catch (e: Exception) {
-                      null
                   }
+                  return null
+              }
+
+              private fun buildPrompt(
+                  texts: List<String>, ctx: List<Pair<String, String>>, gloss: Map<String, String>
+              ): String {
+                  val arr = JSONArray()
+                  for (t in texts) arr.put(t)
+                  val sb = StringBuilder()
+                  sb.append("You are an award-winning literary translator who translates English web novels (dark fantasy, LitRPG, cultivation, action) into Central Kurdish (Sorani, Arabic script). The reader must feel they are reading a novel originally written in Kurdish.\n\n")
+                  sb.append("STYLE RULES\n")
+                  sb.append("1. Translate the meaning and the feeling, never word by word. Rebuild every sentence in natural Sorani word order (verb at the end) exactly as a native Kurdish novelist would write it. No literal copies of English idioms.\n")
+                  sb.append("2. Narration: vivid, flowing, literary Sorani. Dialogue: natural spoken Sorani that fits each character's personality and mood (rough, polite, sarcastic, cold, etc.).\n")
+                  sb.append("3. Prefer real Kurdish words over Arabic, Persian or English loanwords whenever a good Kurdish word exists.\n")
+                  sb.append("4. System windows, status screens and skill descriptions (often in [ ] or lists): keep them short, clear and in a consistent format.\n")
+                  sb.append("5. Use only correct Sorani letters: ە ێ ۆ ڕ ڵ ک گ ی ڤ چ ژ پ. Never use Arabic ي ك ة ى. Use Kurdish punctuation ، and ؟\n")
+                  sb.append("6. Names: use the GLOSSARY spelling exactly. For every new character, place, skill or item name, transliterate it by sound into Sorani script (do not translate its meaning unless it is an ordinary word) and list it in \"names\".\n")
+                  sb.append("7. Never add, omit, explain or censor anything. Each input paragraph becomes exactly one output string, in the same order.\n\n")
+                  if (gloss.isNotEmpty()) {
+                      sb.append("GLOSSARY (English = Kurdish):\n")
+                      for ((k, v) in gloss.entries.toList().takeLast(80)) sb.append(k).append(" = ").append(v).append('\n')
+                      sb.append('\n')
+                  }
+                  if (ctx.isNotEmpty()) {
+                      sb.append("PREVIOUS PARAGRAPHS (already translated; for continuity of tone and names only; do NOT include them in the output):\n")
+                      for (p in ctx) sb.append("EN: ").append(p.first.take(400)).append("\nKU: ").append(p.second.take(400)).append('\n')
+                      sb.append('\n')
+                  }
+                  sb.append("Return ONLY a JSON object: {\"t\": [exactly ").append(texts.size)
+                  sb.append(" translated strings], \"names\": {\"English name\": \"Kurdish spelling\"}}\n\n")
+                  sb.append("PARAGRAPHS TO TRANSLATE:\n").append(arr.toString())
+                  return sb.toString()
+              }
+
+              /** وەرگێڕانی زیرەکی خۆڕایی، بێ کلیل (Pollinations). ئەگەر کاری نەکرد null دەگەڕێنێتەوە. */
+              fun free(
+                  texts: List<String>, ctx: List<Pair<String, String>>, gloss: Map<String, String>
+              ): GemRes? {
+                  val prompt = buildPrompt(texts, ctx, gloss)
+                  for (attempt in 0..1) {
+                      try {
+                          val body = JSONObject()
+                              .put("model", "openai")
+                              .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
+                              .put("temperature", 0.4)
+                              .put("private", true)
+                          val c = URL("https://text.pollinations.ai/openai").openConnection() as HttpURLConnection
+                          c.requestMethod = "POST"
+                          c.doOutput = true
+                          c.connectTimeout = 10000
+                          c.readTimeout = 120000
+                          c.setRequestProperty("Content-Type", "application/json")
+                          c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+                          val code = c.responseCode
+                          if (code in 200..299) {
+                              val resp = c.inputStream.bufferedReader().use { it.readText() }
+                              val text = JSONObject(resp).getJSONArray("choices").getJSONObject(0)
+                                  .getJSONObject("message").getString("content")
+                              return parseGem(text, texts.size)
+                          }
+                          if (code != 429 && code != 500 && code != 502 && code != 503) return null
+                      } catch (e: Exception) {
+                      }
+                      try { Thread.sleep(3000L * (attempt + 1)) } catch (e: Exception) { }
+                  }
+                  return null
+              }
+
+              /** Gemini لە ڕێگەی Cloudflare Worker ی خۆتەوە (کلیل لە ناو ئەپەکە نییە) */
+              fun worker(
+                  url: String, model: String, texts: List<String>,
+                  ctx: List<Pair<String, String>>, gloss: Map<String, String>
+              ): GemRes? {
+                  val prompt = buildPrompt(texts, ctx, gloss)
+                  for (attempt in 0..1) {
+                      try {
+                          val body = JSONObject().put("prompt", prompt).put("model", model)
+                          val c = URL(url.trim()).openConnection() as HttpURLConnection
+                          c.requestMethod = "POST"
+                          c.doOutput = true
+                          c.connectTimeout = 10000
+                          c.readTimeout = 120000
+                          c.setRequestProperty("Content-Type", "application/json")
+                          c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+                          val code = c.responseCode
+                          if (code in 200..299) {
+                              val resp = c.inputStream.bufferedReader().use { it.readText() }
+                              return parseGem(JSONObject(resp).getString("text"), texts.size)
+                          }
+                          if (code != 429 && code < 500) return null
+                      } catch (e: Exception) {
+                      }
+                      try { Thread.sleep(2500L * (attempt + 1)) } catch (e: Exception) { }
+                  }
+                  return null
+              }
+
+              fun gemini(
+                  key: String, model: String, texts: List<String>,
+                  ctx: List<Pair<String, String>>, gloss: Map<String, String>
+              ): GemRes? {
+                  val prompt = buildPrompt(texts, ctx, gloss)
+                  val models = listOf(model, "gemini-flash-lite-latest").distinct()
+                  for (m in models) {
+                      for (attempt in 0..1) {
+                          val (code, text) = geminiOnce(key, m, prompt)
+                          if (text != null) {
+                              val r = parseGem(text, texts.size)
+                              if (r != null) return r
+                              break
+                          }
+                          if (code == 429 || code == 500 || code == 503 || code == -1) {
+                              try { Thread.sleep(2500L * (attempt + 1)) } catch (e: Exception) { }
+                          } else {
+                              break
+                          }
+                      }
+                  }
+                  return null
               }
           }
 
@@ -625,6 +764,11 @@ jobs:
                   m.hint = "gemini-flash-latest"
                   m.isSingleLine = true
                   m.setText(prefs.getString("gm", "gemini-flash-latest"))
+                  val w = EditText(this)
+                  w.hint = "Worker URL (https://....workers.dev)"
+                  w.isSingleLine = true
+                  w.setText(prefs.getString("wk", ""))
+                  col.addView(w)
                   col.addView(k)
                   col.addView(m)
                   AlertDialog.Builder(this)
@@ -632,7 +776,13 @@ jobs:
                       .setView(col)
                       .setPositiveButton("پاشەکەوت") { _, _ ->
                           prefs.edit().putString("gk", k.text.toString().trim())
-                              .putString("gm", m.text.toString().trim().ifEmpty { "gemini-flash-latest" }).apply()
+                              .putString("gm", m.text.toString().trim().ifEmpty { "gemini-flash-latest" })
+                              .putString("wk", w.text.toString().trim()).apply()
+                      }
+                      .setNeutralButton("کلیلی خۆڕایی وەربگرە") { _, _ ->
+                          try {
+                              startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://aistudio.google.com/apikey")))
+                          } catch (e: Exception) { }
                       }
                       .setNegativeButton("داخستن", null)
                       .show()
@@ -665,31 +815,87 @@ jobs:
                   }
               }
 
+              private var hintShown = false
+
+              private fun loadGloss(): LinkedHashMap<String, String> {
+                  val m = LinkedHashMap<String, String>()
+                  try {
+                      val o = JSONObject(prefs.getString("gloss", "{}") ?: "{}")
+                      val it2 = o.keys()
+                      while (it2.hasNext()) {
+                          val k = it2.next()
+                          m[k] = o.optString(k, "")
+                      }
+                  } catch (e: Exception) {
+                  }
+                  return m
+              }
+
+              private fun saveGloss(m: Map<String, String>) {
+                  val o = JSONObject()
+                  for ((k, v) in m.entries.toList().takeLast(150)) o.put(k, v)
+                  prefs.edit().putString("gloss", o.toString()).apply()
+              }
+
+              private fun googleBatch(texts: List<String>): List<String> {
+                  val fut = texts.map { t -> Tr.gpool.submit(Callable<String> { try { Tr.google(t) } catch (e: Exception) { "" } }) }
+                  return fut.map { try { it.get() } catch (e: Exception) { "" } }
+              }
+
               private fun runBatches(items: List<Pair<Int, String>>) {
                   val key = prefs.getString("gk", "") ?: ""
                   val model = prefs.getString("gm", "gemini-flash-latest") ?: "gemini-flash-latest"
-                  val batches = items.chunked(12)
-                  var left = batches.size
-                  stat.text = "⏳ 0/" + batches.size
-                  for (b in batches) {
-                      Tr.pool.execute {
+                  val wurl = (prefs.getString("wk", "") ?: "").trim()
+                  val useKey = key.isNotBlank()
+                  val useW = !useKey && wurl.startsWith("http")
+                  val strong = useKey || useW
+                  val label = if (strong) "Gemini" else "AI"
+                  val batches = items.chunked(if (strong) 14 else 8)
+                  stat.text = "⏳ " + label + " 0/" + batches.size
+                  Tr.pool.execute {
+                      var ok = 0
+                      var goo = 0
+                      var ctx: List<Pair<String, String>> = emptyList()
+                      val gloss = loadGloss()
+                      for ((bi, b) in batches.withIndex()) {
                           val texts = b.map { it.second }
-                          var res: List<String>? = null
-                          if (key.isNotBlank()) res = Tr.gemini(key, model, texts)
-                          if (res == null) {
-                              val fut = texts.map { t -> Tr.gpool.submit(Callable<String> { try { Tr.google(t) } catch (e: Exception) { "" } }) }
-                              res = fut.map { try { it.get() } catch (e: Exception) { "" } }
+                          val gr = if (useKey) {
+                              Tr.gemini(key, model, texts, ctx, gloss)
+                          } else if (useW) {
+                              Tr.worker(wurl, model, texts, ctx, gloss) ?: Tr.free(texts, ctx, gloss)
+                          } else {
+                              Tr.free(texts, ctx, gloss)
                           }
-                          val fin: List<String> = res
+                          val fin: List<String>
+                          if (gr != null) {
+                              fin = gr.texts
+                              ok++
+                              gloss.putAll(gr.names)
+                              ctx = texts.zip(fin).takeLast(3)
+                          } else {
+                              fin = googleBatch(texts)
+                              goo++
+                              ctx = emptyList()
+                          }
                           val arr = JSONArray()
                           for ((i, p) in b.withIndex()) {
                               if (fin[i].isNotBlank()) arr.put(JSONObject().put("i", p.first).put("t", fin[i]))
                           }
+                          val done = bi + 1
                           ui.post {
                               web.evaluateJavascript("window.__kmSet(" + arr.toString() + ");", null)
-                              left--
-                              stat.text = if (left <= 0) "✓" else "⏳ " + (batches.size - left) + "/" + batches.size
-                              if (left <= 0) busy = false
+                              stat.text = "⏳ " + label + " " + done + "/" + batches.size
+                          }
+                      }
+                      saveGloss(gloss)
+                      ui.post {
+                          stat.text = "✓ " + label + " " + ok + (if (goo > 0) " · Google " + goo else "")
+                          busy = false
+                          if (ok == 0) {
+                              toast(
+                                  if (strong) "Gemini کاری نەکرد (کلیل هەڵەیە یان سنووری ڕۆژانە تەواو بووە). Google Translate بەکارهات."
+                                  else "وەرگێڕانی زیرەکی خۆڕایی ئێستا کاری نەکرد. Google Translate بەکارهات."
+                              )
                           }
                       }
                   }
