@@ -334,7 +334,7 @@ jobs:
                           c.requestMethod = "POST"
                           c.doOutput = true
                           c.connectTimeout = 10000
-                          c.readTimeout = 70000
+                          c.readTimeout = 45000
                           c.setRequestProperty("Content-Type", "application/json")
                           c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
                           val code = c.responseCode
@@ -860,6 +860,7 @@ jobs:
                   val strong = useKey || useW
                   val batches = items.chunked(if (strong) 14 else 8)
                   stat.text = "⏳ " + (if (strong) "Gemini" else "AI") + " 0/" + batches.size
+                  val gDone = BooleanArray(batches.size)
                   Tr.pool.execute {
                       var nStrong = 0
                       var nFree = 0
@@ -887,24 +888,26 @@ jobs:
                               gr = Tr.free(texts, ctx, gloss)
                               if (gr != null) nFree++ else freeOk = false
                           }
-                          val fin: List<String>
+                          val fin: List<String> = gr?.texts ?: emptyList()
                           if (gr != null) {
-                              fin = gr.texts
                               gloss.putAll(gr.names)
                               ctx = texts.zip(fin).takeLast(3)
                           } else {
-                              fin = googleBatch(texts)
                               nGoogle++
                               ctx = emptyList()
                           }
                           val arr = JSONArray()
                           for ((i, p) in b.withIndex()) {
-                              if (fin[i].isNotBlank()) arr.put(JSONObject().put("i", p.first).put("t", fin[i]))
+                              if (i < fin.size && fin[i].isNotBlank()) arr.put(JSONObject().put("i", p.first).put("t", fin[i]))
                           }
+                          val aiOk = gr != null
                           val done = bi + 1
                           val lab = if (strongOk) "Gemini" else if (freeOk) "AI" else "Google"
                           ui.post {
-                              web.evaluateJavascript("window.__kmSet(" + arr.toString() + ");", null)
+                              if (aiOk) {
+                                  gDone[bi] = true
+                                  web.evaluateJavascript("window.__kmSet(" + arr.toString() + ");", null)
+                              }
                               stat.text = "⏳ " + lab + " " + done + "/" + batches.size
                           }
                       }
@@ -916,6 +919,18 @@ jobs:
                       ui.post {
                           stat.text = "✓ " + parts.joinToString(" · ")
                           busy = false
+                      }
+                  }
+                  for ((gi, gb) in batches.withIndex()) {
+                      Tr.pool.execute {
+                          val gt = googleBatch(gb.map { it.second })
+                          val ga = JSONArray()
+                          for ((i, p) in gb.withIndex()) {
+                              if (i < gt.size && gt[i].isNotBlank()) ga.put(JSONObject().put("i", p.first).put("t", gt[i]))
+                          }
+                          ui.post {
+                              if (!gDone[gi]) web.evaluateJavascript("window.__kmSet(" + ga.toString() + ");", null)
+                          }
                       }
                   }
               }
