@@ -196,6 +196,8 @@ jobs:
                   return parts.joinToString(" ") { googleChunk(it) }
               }
 
+              @Volatile var lastErr = ""
+
               class GemRes(val texts: List<String>, val names: Map<String, String>)
 
               private fun geminiOnce(key: String, model: String, prompt: String): Pair<Int, String?> {
@@ -301,7 +303,7 @@ jobs:
                           c.requestMethod = "POST"
                           c.doOutput = true
                           c.connectTimeout = 10000
-                          c.readTimeout = 120000
+                          c.readTimeout = 50000
                           c.setRequestProperty("Content-Type", "application/json")
                           c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
                           val code = c.responseCode
@@ -332,18 +334,23 @@ jobs:
                           c.requestMethod = "POST"
                           c.doOutput = true
                           c.connectTimeout = 10000
-                          c.readTimeout = 120000
+                          c.readTimeout = 70000
                           c.setRequestProperty("Content-Type", "application/json")
                           c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
                           val code = c.responseCode
                           if (code in 200..299) {
                               val resp = c.inputStream.bufferedReader().use { it.readText() }
-                              return parseGem(JSONObject(resp).getString("text"), texts.size)
+                              val r = parseGem(JSONObject(resp).getString("text"), texts.size)
+                              if (r == null) lastErr = "وەڵامی Gemini ڕێک نەبوو"
+                              return r
                           }
-                          if (code != 429 && code < 500) return null
+                          val es = try { c.errorStream?.bufferedReader()?.use { it.readText() } ?: "" } catch (x: Exception) { "" }
+                          lastErr = "HTTP " + code + " " + es.take(240)
+                          if (code != 429) return null
                       } catch (e: Exception) {
+                          lastErr = "پەیوەندی بە Worker نەکرا: " + (e.message ?: e.javaClass.simpleName)
                       }
-                      try { Thread.sleep(2500L * (attempt + 1)) } catch (e: Exception) { }
+                      try { Thread.sleep(2500L) } catch (e: Exception) { }
                   }
                   return null
               }
@@ -372,6 +379,8 @@ jobs:
                   return null
               }
           }
+
+          private const val DEFAULT_WORKER = "https://yellow-limit-446a.alandbaxtyar568.workers.dev/novel"
 
           private const val JS_INIT = """
           (function(){
@@ -767,7 +776,7 @@ jobs:
                   val w = EditText(this)
                   w.hint = "Worker URL (https://....workers.dev)"
                   w.isSingleLine = true
-                  w.setText(prefs.getString("wk", ""))
+                  w.setText(prefs.getString("wk", DEFAULT_WORKER))
                   col.addView(w)
                   col.addView(k)
                   col.addView(m)
@@ -845,36 +854,47 @@ jobs:
               private fun runBatches(items: List<Pair<Int, String>>) {
                   val key = prefs.getString("gk", "") ?: ""
                   val model = prefs.getString("gm", "gemini-flash-latest") ?: "gemini-flash-latest"
-                  val wurl = (prefs.getString("wk", "") ?: "").trim()
+                  val wurl = (prefs.getString("wk", DEFAULT_WORKER) ?: "").trim()
                   val useKey = key.isNotBlank()
                   val useW = !useKey && wurl.startsWith("http")
                   val strong = useKey || useW
-                  val label = if (strong) "Gemini" else "AI"
                   val batches = items.chunked(if (strong) 14 else 8)
-                  stat.text = "⏳ " + label + " 0/" + batches.size
+                  stat.text = "⏳ " + (if (strong) "Gemini" else "AI") + " 0/" + batches.size
                   Tr.pool.execute {
-                      var ok = 0
-                      var goo = 0
+                      var nStrong = 0
+                      var nFree = 0
+                      var nGoogle = 0
+                      var strongOk = strong
+                      var freeOk = true
+                      var err = ""
                       var ctx: List<Pair<String, String>> = emptyList()
                       val gloss = loadGloss()
                       for ((bi, b) in batches.withIndex()) {
                           val texts = b.map { it.second }
-                          val gr = if (useKey) {
-                              Tr.gemini(key, model, texts, ctx, gloss)
-                          } else if (useW) {
-                              Tr.worker(wurl, model, texts, ctx, gloss) ?: Tr.free(texts, ctx, gloss)
-                          } else {
-                              Tr.free(texts, ctx, gloss)
+                          var gr: Tr.GemRes? = null
+                          if (strongOk) {
+                              gr = if (useKey) Tr.gemini(key, model, texts, ctx, gloss) else Tr.worker(wurl, model, texts, ctx, gloss)
+                              if (gr != null) {
+                                  nStrong++
+                              } else {
+                                  strongOk = false
+                                  err = if (useKey) "کلیلی Gemini کاری نەکرد" else Tr.lastErr
+                                  val msg = err
+                                  ui.post { toast("Gemini: " + msg) }
+                              }
+                          }
+                          if (gr == null && freeOk) {
+                              gr = Tr.free(texts, ctx, gloss)
+                              if (gr != null) nFree++ else freeOk = false
                           }
                           val fin: List<String>
                           if (gr != null) {
                               fin = gr.texts
-                              ok++
                               gloss.putAll(gr.names)
                               ctx = texts.zip(fin).takeLast(3)
                           } else {
                               fin = googleBatch(texts)
-                              goo++
+                              nGoogle++
                               ctx = emptyList()
                           }
                           val arr = JSONArray()
@@ -882,21 +902,20 @@ jobs:
                               if (fin[i].isNotBlank()) arr.put(JSONObject().put("i", p.first).put("t", fin[i]))
                           }
                           val done = bi + 1
+                          val lab = if (strongOk) "Gemini" else if (freeOk) "AI" else "Google"
                           ui.post {
                               web.evaluateJavascript("window.__kmSet(" + arr.toString() + ");", null)
-                              stat.text = "⏳ " + label + " " + done + "/" + batches.size
+                              stat.text = "⏳ " + lab + " " + done + "/" + batches.size
                           }
                       }
                       saveGloss(gloss)
+                      val parts = ArrayList<String>()
+                      if (nStrong > 0) parts.add("Gemini " + nStrong)
+                      if (nFree > 0) parts.add("AI " + nFree)
+                      if (nGoogle > 0) parts.add("Google " + nGoogle)
                       ui.post {
-                          stat.text = "✓ " + label + " " + ok + (if (goo > 0) " · Google " + goo else "")
+                          stat.text = "✓ " + parts.joinToString(" · ")
                           busy = false
-                          if (ok == 0) {
-                              toast(
-                                  if (strong) "Gemini کاری نەکرد (کلیل هەڵەیە یان سنووری ڕۆژانە تەواو بووە). Google Translate بەکارهات."
-                                  else "وەرگێڕانی زیرەکی خۆڕایی ئێستا کاری نەکرد. Google Translate بەکارهات."
-                              )
-                          }
                       }
                   }
               }
